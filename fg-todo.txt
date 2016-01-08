@@ -1,0 +1,12 @@
+multiple transaction versions
+  different source transaction versions for single linklist
+listview-based queries (lv backed Results?)
+testing
+  make ECH mockable
+  make the tests and fuzzer single-threaded
+  write lots of tests
+  fuzz things
+rest of the examples
+better api
+perf testing + optim
+docs

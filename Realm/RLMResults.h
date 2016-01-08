@@ -203,6 +203,10 @@ RLM_ASSUME_NONNULL_BEGIN
  */
 - (RLMNotificationToken *)addNotificationBlock:(void (^)(RLMResults RLM_GENERIC_RETURN *__nullable results, NSError *__nullable error))block;
 
+
+- (RLMNotificationToken *)addNotificationBlockWatchingKeypaths:(NSArray<NSString *> *)keyPaths
+                                                       changes:(void (^)(RLMResults *, NSArray<RLMObjectChange *> *, NSError *))block;
+
 #pragma mark - Aggregating Property Values
 
 /**

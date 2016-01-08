@@ -22,6 +22,7 @@
 #include "impl/cached_realm.hpp"
 #include "impl/external_commit_helper.hpp"
 #include "impl/transact_log_handler.hpp"
+#include "impl/list_notification_helper.hpp"
 #include "object_store.hpp"
 #include "schema.hpp"
 
@@ -32,6 +33,7 @@
 #include <realm/table_view.hpp>
 
 #include <cassert>
+#include <set>
 #include <unordered_map>
 
 #include <unordered_map>
@@ -113,7 +115,7 @@ std::shared_ptr<Realm> RealmCoordinator::get_realm(Realm::Config config)
         }
     }
 
-    auto realm = std::make_shared<Realm>(std::move(config));
+    auto realm = std::make_shared<Realm>(config);
     realm->init(shared_from_this());
     m_cached_realms.emplace_back(realm, m_config.cache);
     return realm;
@@ -127,13 +129,6 @@ std::shared_ptr<Realm> RealmCoordinator::get_realm()
 const Schema* RealmCoordinator::get_schema() const noexcept
 {
     return m_cached_realms.empty() ? nullptr : m_config.schema.get();
-}
-
-void RealmCoordinator::update_schema(Schema const& schema)
-{
-    // FIXME: this should probably be doing some sort of validation and
-    // notifying all Realm instances of the new schema in some way
-    m_config.schema = std::make_unique<Schema>(schema);
 }
 
 RealmCoordinator::RealmCoordinator() = default;
@@ -239,7 +234,7 @@ void RealmCoordinator::pin_version(uint_fast64_t version, uint_fast32_t index)
     }
 }
 
-void RealmCoordinator::register_query(std::shared_ptr<AsyncQuery> query)
+void RealmCoordinator::register_query(std::shared_ptr<CallbackCollection> query)
 {
     auto version = query->version();
     auto& self = Realm::Internal::get_coordinator(query->get_realm());
@@ -260,7 +255,7 @@ void RealmCoordinator::clean_up_dead_queries()
 
             // Ensure the query is destroyed here even if there's lingering refs
             // to the async query elsewhere
-            container[i]->release_query();
+            container[i]->release_data();
 
             if (container.size() > i + 1)
                 container[i] = std::move(container.back());
@@ -323,7 +318,7 @@ void RealmCoordinator::run_async_queries()
     lock.unlock();
 
     for (auto& query : queries_to_run) {
-        query->run();
+        query->run(m_change_info);
     }
 
     // Reacquire the lock while updating the fields that are actually read on
@@ -335,6 +330,7 @@ void RealmCoordinator::run_async_queries()
         }
     }
 
+    m_change_info.tables.clear();
     clean_up_dead_queries();
 }
 
@@ -369,7 +365,8 @@ void RealmCoordinator::move_new_queries_to_main()
 void RealmCoordinator::advance_helper_shared_group_to_latest()
 {
     if (m_new_queries.empty()) {
-        LangBindHelper::advance_read(*m_query_sg, *m_query_history);
+        transaction::advance_and_observe_linkviews(*m_query_sg, *m_query_history,
+                                                   m_change_info);
         return;
     }
 
@@ -379,22 +376,30 @@ void RealmCoordinator::advance_helper_shared_group_to_latest()
         return lft->version() < rgt->version();
     });
 
+    TransactionChangeInfo new_change_info;
     // Import all newly added queries to our helper SG
     for (auto& query : m_new_queries) {
-        LangBindHelper::advance_read(*m_advancer_sg, *m_advancer_history, query->version());
+        transaction::advance_and_observe_linkviews(*m_advancer_sg, *m_advancer_history,
+                                                   new_change_info, query->version());
         query->attach_to(*m_advancer_sg);
+        query->add_required_change_info(new_change_info);
     }
 
     // Advance both SGs to the newest version
-    LangBindHelper::advance_read(*m_advancer_sg, *m_advancer_history);
-    LangBindHelper::advance_read(*m_query_sg, *m_query_history,
-                                 m_advancer_sg->get_version_of_current_transaction());
+    // FIXME: this is now expensive, so need to think about impact on locking scheme
+    transaction::advance_and_observe_linkviews(*m_advancer_sg, *m_advancer_history,
+                                               new_change_info);
+    transaction::advance_and_observe_linkviews(*m_query_sg, *m_query_history,
+                                               m_change_info,
+                                               m_advancer_sg->get_version_of_current_transaction());
 
     // Transfer all new queries over to the main SG
     for (auto& query : m_new_queries) {
-        query->detatch();
+        query->detach();
         query->attach_to(*m_query_sg);
     }
+
+    std::move(begin(new_change_info.lists), end(new_change_info.lists), back_inserter(m_change_info.lists));
 
     move_new_queries_to_main();
     m_advancer_sg->end_read();
@@ -451,7 +456,7 @@ void RealmCoordinator::advance_to_ready(Realm& realm)
 
         // Query version now matches the SG version, so we can deliver them
         for (auto& query : m_queries) {
-            if (query->deliver(sg, m_async_error)) {
+            if (query->deliver(sg, m_async_error, m_change_info)) {
                 queries.push_back(query);
             }
         }
@@ -470,7 +475,7 @@ void RealmCoordinator::process_available_async(Realm& realm)
     {
         std::lock_guard<std::mutex> lock(m_query_mutex);
         for (auto& query : m_queries) {
-            if (query->deliver(sg, m_async_error)) {
+            if (query->deliver(sg, m_async_error, m_change_info)) {
                 queries.push_back(query);
             }
         }

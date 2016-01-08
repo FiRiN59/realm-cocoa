@@ -19,22 +19,49 @@
 #ifndef REALM_COORDINATOR_HPP
 #define REALM_COORDINATOR_HPP
 
+#include "index_set.hpp"
 #include "shared_realm.hpp"
 
 #include <realm/string_data.hpp>
+
+#include <map>
+#include <set>
 
 namespace realm {
 class AsyncQueryCallback;
 class ClientHistory;
 class Results;
 class SharedGroup;
-class Schema;
 struct AsyncQueryCancelationToken;
 
 namespace _impl {
-class AsyncQuery;
 class CachedRealm;
+class CallbackCollection;
 class ExternalCommitHelper;
+class ListNotificationHelper;
+
+struct ListChangeInfo {
+    size_t table_ndx;
+    size_t row_ndx;
+    size_t col_ndx;
+
+    IndexSet inserts;
+    IndexSet deletes;
+    IndexSet changes;
+    std::vector<std::pair<size_t, size_t>> moves;
+};
+
+struct TableChangeInfo {
+    IndexSet inserts;
+    IndexSet deletes;
+    IndexSet changes;
+    std::map<size_t, size_t> moves;
+};
+
+struct TransactionChangeInfo {
+    std::vector<ListChangeInfo> lists;
+    std::vector<TableChangeInfo> tables;
+};
 
 // RealmCoordinator manages the weak cache of Realm instances and communication
 // between per-thread Realm instances for a given file
@@ -77,10 +104,7 @@ public:
     // Called by m_notifier when there's a new commit to send notifications for
     void on_change();
 
-    // Update the schema in the cached config
-    void update_schema(Schema const& new_schema);
-
-    static void register_query(std::shared_ptr<AsyncQuery> query);
+    static void register_query(std::shared_ptr<CallbackCollection> query);
 
     // Advance the Realm to the most recent transaction version which all async
     // work is complete for
@@ -94,8 +118,8 @@ private:
     std::vector<CachedRealm> m_cached_realms;
 
     std::mutex m_query_mutex;
-    std::vector<std::shared_ptr<_impl::AsyncQuery>> m_new_queries;
-    std::vector<std::shared_ptr<_impl::AsyncQuery>> m_queries;
+    std::vector<std::shared_ptr<_impl::CallbackCollection>> m_new_queries;
+    std::vector<std::shared_ptr<_impl::CallbackCollection>> m_queries;
 
     // SharedGroup used for actually running async queries
     // Will have a read transaction iff m_queries is non-empty
@@ -108,6 +132,8 @@ private:
     std::unique_ptr<ClientHistory> m_advancer_history;
     std::unique_ptr<SharedGroup> m_advancer_sg;
     std::exception_ptr m_async_error;
+
+    TransactionChangeInfo m_change_info;
 
     std::unique_ptr<_impl::ExternalCommitHelper> m_notifier;
 
